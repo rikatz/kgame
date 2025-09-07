@@ -14,6 +14,8 @@
 
 # We need all the Make variables exported as env vars.
 # Note that the ?= operator works regardless.
+GATEWAY_API_VERSION ?= v1.3.0
+CRD ?= https://github.com/kubernetes-sigs/gateway-api/releases/download/$(GATEWAY_API_VERSION)/standard-install.yaml
 
 # Run go fmt against code
 .PHONY: fmt
@@ -37,6 +39,11 @@ ci-lint: golangci-lint
 # Run all the validations
 .PHONY: verify
 verify: fmt vet ci-lint
+
+
+.PHONY: install-crd
+install-crd:
+	kubectl apply -f $(CRD)
 
 ## Location to install dependencies to
 LOCALBIN ?= $(shell pwd)/bin
