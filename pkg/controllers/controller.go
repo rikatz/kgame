@@ -24,7 +24,6 @@ var (
 type Controller struct {
 	mgr    ctrl.Manager
 	logger logr.Logger
-	scheme runtime.Scheme
 }
 
 type ControllerOptions struct {

@@ -23,7 +23,6 @@ import (
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -33,11 +32,10 @@ import (
 )
 
 type reconciler struct {
-	className string
-	client    client.Client
-	scheme    *runtime.Scheme
-	logger    logr.Logger
-	options   GatewayClassOptions
+	client  client.Client
+	scheme  *runtime.Scheme
+	logger  logr.Logger
+	options GatewayClassOptions
 }
 
 // AddFinalizerFunc is a function that should be called immediately before adding a
@@ -84,7 +82,10 @@ func (r *reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 
-	if !gatewayClass.GetDeletionTimestamp().IsZero() {
+	// Make a copy of the original resource, to be used on the patch helper
+	originalResource := gatewayClass.DeepCopy()
+
+	if gatewayClass.GetDeletionTimestamp() != nil && !gatewayClass.GetDeletionTimestamp().IsZero() {
 		if r.options.FinalizerName != "" && controllerutil.RemoveFinalizer(&gatewayClass, r.options.FinalizerName) {
 			if r.options.RemoveFinalizerFunc != nil {
 				if err := r.options.RemoveFinalizerFunc(ctx); err != nil {
@@ -93,31 +94,22 @@ func (r *reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			}
 
 			r.logger.Info("removing finalizer", "finalizer", r.options.FinalizerName)
-			return reconcile.Result{}, r.client.Update(ctx, &gatewayClass)
+			return reconcile.Result{}, r.client.Patch(ctx, &gatewayClass, client.MergeFrom(originalResource))
 		}
 	}
 
-	// Normal update, should try to add a finalizer if none exists
-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		if err := r.client.Get(ctx, req.NamespacedName, &gatewayClass); err != nil {
-			// Could not get GatewayClass (maybe deleted)
-			return client.IgnoreNotFound(err)
-		}
-
-		if r.options.FinalizerName != "" && controllerutil.AddFinalizer(&gatewayClass, r.options.FinalizerName) {
-			if r.options.AddFinalizerFunc != nil {
-				if err := r.options.AddFinalizerFunc(ctx); err != nil {
-					return fmt.Errorf("error executing pre-finalizer add function: %w", err)
-				}
+	if r.options.FinalizerName != "" && controllerutil.AddFinalizer(&gatewayClass, r.options.FinalizerName) {
+		if r.options.AddFinalizerFunc != nil {
+			if err := r.options.AddFinalizerFunc(ctx); err != nil {
+				return reconcile.Result{}, fmt.Errorf("error executing pre-finalizer add function: %w", err)
 			}
-			r.logger.Info("adding finalizer", "finalizer", r.options.FinalizerName)
-			return r.client.Update(ctx, &gatewayClass)
 		}
-		markAsAccepted(gatewayClass.Status.Conditions, gatewayClass.Generation)
-		return r.client.Status().Update(ctx, &gatewayClass)
-	})
+		r.logger.Info("adding finalizer", "finalizer", r.options.FinalizerName)
+		return reconcile.Result{}, r.client.Patch(ctx, &gatewayClass, client.MergeFrom(originalResource))
+	}
 
-	return reconcile.Result{}, err
+	markAsAccepted(gatewayClass.Status.Conditions, gatewayClass.Generation)
+	return reconcile.Result{}, r.client.Status().Patch(ctx, &gatewayClass, client.MergeFrom(originalResource))
 }
 
 func markAsAccepted(conditions []metav1.Condition, generation int64) {
