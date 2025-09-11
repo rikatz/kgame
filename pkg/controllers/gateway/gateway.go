@@ -5,23 +5,24 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 type reconciler struct {
-	className string
-	client    client.Client
-	scheme    *runtime.Scheme
-	logger    logr.Logger
-	options   GatewayOptions
+	client  client.Client
+	scheme  *runtime.Scheme
+	logger  logr.Logger
+	options GatewayOptions
 }
 
 // AddFinalizerFunc is a function that should be called immediately before adding a
@@ -39,6 +40,30 @@ type GatewayOptions struct {
 	RemoveFinalizerFunc RemoveFinalizerFunc
 }
 
+// matchManagedGatewayClass will check the object Gateway Class to define if it should
+// be reconciled or not.
+// Because this controller already ignores caching any non managed GatewayClass,
+// any attempt to Get a gatewayclass that does not exist represents that this is
+// a gatewayClass that this controller does not manage, so we don't need to match
+// the GatewayClass spec.ControllerName
+func matchManagedGatewayClass(kubeclient client.Client, logger logr.Logger) func(obj client.Object) bool {
+	return func(obj client.Object) bool {
+		gw, ok := obj.(*gatewayv1.Gateway)
+		if !ok {
+			return false
+		}
+
+		gatewayclass := &gatewayv1.GatewayClass{}
+		gatewayclass.SetName(string(gw.Spec.GatewayClassName))
+		err := kubeclient.Get(context.Background(), client.ObjectKeyFromObject(gatewayclass), gatewayclass)
+		if err != nil {
+			logger.Info("gatewayclass not managed by this controller", "gatewayclass", gatewayclass.Name, "gateway", obj.GetName(), "namespace", obj.GetNamespace())
+			return false
+		}
+		return true
+	}
+}
+
 // SetupWithManager sets the Gateway controller to be started with the current
 // manager
 // This manager will start the following indexers:
@@ -48,7 +73,11 @@ type GatewayOptions struct {
 //   - Services - Will be used to define if a service created by this reconciler has some state change
 func SetupWithManager(mgr manager.Manager, options GatewayOptions) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&gatewayv1.Gateway{}).
+		For(&gatewayv1.Gateway{},
+			builder.WithPredicates(predicate.NewPredicateFuncs(
+				matchManagedGatewayClass(
+					mgr.GetClient(),
+					mgr.GetLogger().WithValues("predicate", "gateway"))))).
 		Complete(&reconciler{
 			options: options,
 			client:  mgr.GetClient(),
@@ -64,14 +93,16 @@ func (r *reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 
 	gateway := gatewayv1.Gateway{}
 	if err := r.client.Get(ctx, req.NamespacedName, &gateway); err != nil {
-		if client.IgnoreNotFound(err) == nil {
+		if apierrors.IsNotFound(err) {
 			return reconcile.Result{}, nil
 		}
 		logger.Error(err, "unable to reconcile")
 		return reconcile.Result{}, err
 	}
 
-	if !gateway.GetDeletionTimestamp().IsZero() {
+	originalGw := gateway.DeepCopy()
+
+	if gateway.GetDeletionTimestamp() != nil && !gateway.GetDeletionTimestamp().IsZero() {
 		if r.options.FinalizerName != "" && controllerutil.RemoveFinalizer(&gateway, r.options.FinalizerName) {
 			if r.options.RemoveFinalizerFunc != nil {
 				if err := r.options.RemoveFinalizerFunc(ctx); err != nil {
@@ -80,38 +111,33 @@ func (r *reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			}
 
 			r.logger.Info("removing finalizer", "finalizer", r.options.FinalizerName)
-			return reconcile.Result{}, r.client.Update(ctx, &gateway)
+			return reconcile.Result{}, r.client.Patch(ctx, &gateway, client.MergeFrom(originalGw))
 		}
 	}
 
 	// Normal update, should try to add a finalizer if none exists
-	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		if err := r.client.Get(ctx, req.NamespacedName, &gateway); err != nil {
-			// Could not get Gateway (maybe deleted)
-			return client.IgnoreNotFound(err)
+	if r.options.FinalizerName != "" && controllerutil.AddFinalizer(&gateway, r.options.FinalizerName) {
+		if r.options.AddFinalizerFunc != nil {
+			if err := r.options.AddFinalizerFunc(ctx); err != nil {
+				return reconcile.Result{}, fmt.Errorf("error executing pre-finalizer add function: %w", err)
+			}
 		}
 
-		if r.options.FinalizerName != "" && controllerutil.AddFinalizer(&gateway, r.options.FinalizerName) {
-			if r.options.AddFinalizerFunc != nil {
-				if err := r.options.AddFinalizerFunc(ctx); err != nil {
-					return fmt.Errorf("error executing pre-finalizer add function: %w", err)
-				}
-			}
-			r.logger.Info("adding finalizer", "finalizer", r.options.FinalizerName)
-			if err := r.client.Update(ctx, &gateway); err != nil {
-				return err
-			}
+		r.logger.Info("adding finalizer", "finalizer", r.options.FinalizerName)
+		if err := r.client.Patch(ctx, &gateway, client.MergeFrom(originalGw)); err != nil {
+			return reconcile.Result{}, err
 		}
-		mutateConditions(gateway.Status.Conditions,
-			gatewayv1.GatewayConditionAccepted,
-			gatewayv1.GatewayReasonAccepted,
-			metav1.ConditionTrue,
-			"Gateway is accepted",
-			gateway.Generation)
-		return r.client.Status().Update(ctx, &gateway)
-	})
-	if err != nil {
-		return reconcile.Result{}, err
+	}
+
+	mutateConditions(gateway.Status.Conditions,
+		gatewayv1.GatewayConditionAccepted,
+		gatewayv1.GatewayReasonAccepted,
+		metav1.ConditionTrue,
+		"Gateway is accepted",
+		gateway.Generation)
+
+	if err := r.client.Status().Patch(ctx, &gateway, client.MergeFrom(originalGw)); err != nil {
+		return reconcile.Result{}, fmt.Errorf("error adding accepted condition on %s: %w", req.String(), err)
 	}
 
 	// Call the programming logic of the gateway, then mutate the conditions for programmed
@@ -123,18 +149,21 @@ func (r *reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		metav1.ConditionTrue,
 		"Gateway is programmed",
 		gateway.Generation)
-	return reconcile.Result{}, r.client.Status().Update(ctx, &gateway)
 
+	if err := r.client.Status().Patch(ctx, &gateway, client.MergeFrom(originalGw)); err != nil {
+		return reconcile.Result{}, fmt.Errorf("error adding programmed condition on %s: %w", req.String(), err)
+	}
+
+	return reconcile.Result{}, nil
 }
 
-// TODO: Improve this function to mutate the conditions properly, adding not only
-// the accepted but other supported conditions
+// mutateConditions mutates in place conditions.
 func mutateConditions(conditions []metav1.Condition,
 	condtype gatewayv1.GatewayConditionType,
 	reason gatewayv1.GatewayConditionReason,
 	status metav1.ConditionStatus,
 	message string,
-	generation int64) {
+	generation int64) []metav1.Condition {
 
 	var found bool
 
@@ -147,13 +176,15 @@ func mutateConditions(conditions []metav1.Condition,
 		ObservedGeneration: generation,
 	}
 
-	for i, cond := range conditions {
-		if cond.Type == string(condtype) {
+	for i := range conditions {
+		if conditions[i].Type == string(condtype) {
 			conditions[i] = newCondition
 			found = true
+			break
 		}
 	}
 	if !found {
 		conditions = append(conditions, newCondition)
 	}
+	return conditions
 }
